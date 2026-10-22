@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hifihedgehog/ScamGuard/actions/workflows/tests.yml"><img src="https://github.com/hifihedgehog/ScamGuard/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/hifihedgehog/ScamGuard/actions/workflows/tests.yml"><img src="https://github.com/hifihedgehog/ScamGuard/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/hifihedgehog/ScamGuard?color=f5a623" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-1f2a44" alt="Python 3.11, 3.12, 3.13">
   <img src="https://img.shields.io/badge/discord.py-2.7.1-5865f2" alt="discord.py 2.7.1">
@@ -33,18 +33,26 @@ It was built for a 43,000-member server to replace two bots, [Honeypot](https://
 Every message runs through three rules, in this order.
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "15px", "lineColor": "#8a94a8", "textColor": "#1f2a44", "edgeLabelBackground": "#eef1f6"}}}%%
 flowchart TD
-    M([Message posted]) --> X{Exempt channel or<br/>the log channel?}
+    M([A message is posted]) --> X{Exempt channel or<br/>the log channel?}
     X -- yes --> I0([Ignored])
     X -- no --> T{In a trap channel?}
-    T -- "yes, member" --> A1[Softban]
-    T -- "yes, staff" --> I0
+    T -- staff --> I0
+    T -- member --> A1[Softban]
     T -- no --> K{Image matches a<br/>known scam?}
-    K -- "yes, member" --> A2[Softban]
-    K -- "yes, staff" --> D[Delete and report,<br/>no punishment]
+    K -- staff --> D[Deleted and reported,<br/>no punishment]
+    K -- member --> A2[Softban]
     K -- no --> B{Same post in 3+ channels<br/>within 10 seconds?}
-    B -- "yes, member" --> A3[24-hour timeout]
+    B -- member --> A3[24-hour timeout]
     B -- no --> N([Nothing happens])
+
+    classDef ask fill:#1f2a44,stroke:#f5a623,stroke-width:2px,color:#ffffff
+    classDef act fill:#f5a623,stroke:#c77700,stroke-width:2px,color:#1f2a44,font-weight:bold
+    classDef calm fill:#eef1f6,stroke:#8a94a8,color:#1f2a44
+    class X,T,K,B ask
+    class A1,A2,A3 act
+    class M,I0,N,D calm
 ```
 
 | Rule | Catches | Default action |
