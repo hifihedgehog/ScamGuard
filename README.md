@@ -1,12 +1,51 @@
-# ScamGuard
+<p align="center">
+  <img src="assets/header.png" alt="ScamGuard: removes scam posts, and the accounts posting them, from your Discord server" width="100%">
+</p>
 
-ScamGuard is a self-hosted Discord bot that removes scam posts, and the accounts posting them, from one server. It catches posts in a trap channel, known scam images, and the same message blasted across channels by a hijacked account. It does no verification or captcha.
+<p align="center">
+  <a href="https://github.com/hifihedgehog/ScamGuard/actions/workflows/tests.yml"><img src="https://github.com/hifihedgehog/ScamGuard/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/hifihedgehog/ScamGuard?color=f5a623" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-1f2a44" alt="Python 3.11, 3.12, 3.13">
+  <img src="https://img.shields.io/badge/discord.py-2.7.1-5865f2" alt="discord.py 2.7.1">
+</p>
 
-It was built for a 43,000-member server to replace two bots, [Honeypot](https://github.com/RiskyMH/honeypot) and [MadHoney](https://github.com/nomadsgalaxy/MadHoney), and its trap-channel and cross-channel rules follow their designs.
+<p align="center">
+  <a href="#what-it-catches">What it catches</a> ·
+  <a href="#how-it-compares">How it compares</a> ·
+  <a href="#setting-it-up">Setup</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#settings">Settings</a> ·
+  <a href="#security">Security</a>
+</p>
+
+ScamGuard is a self-hosted Discord bot that removes scam posts, and the accounts posting them, from one server. It catches posts in a trap channel, known scam images, and the same message blasted across channels by a hijacked account. It does no verification or captcha, and every setting except the token is changed from inside Discord.
+
+It was built for a 43,000-member server to replace two bots, [Honeypot](https://github.com/RiskyMH/honeypot) and [MadHoney](https://github.com/nomadsgalaxy/MadHoney). Its trap-channel and cross-channel rules follow their designs.
+
+| Measured on that server, October 2026 | Result |
+|---|---|
+| Copies of real scam images matched | 84 of 84, all within 14 of 256 bits |
+| Member uploads matched by mistake | 0 of 601, the closest 92 bits away |
+| Tests, on every push | 89, on Python 3.11, 3.12 and 3.13 |
 
 ## What it catches
 
 Every message runs through three rules, in this order.
+
+```mermaid
+flowchart TD
+    M([Message posted]) --> X{Exempt channel or<br/>the log channel?}
+    X -- yes --> I0([Ignored])
+    X -- no --> T{In a trap channel?}
+    T -- "yes, member" --> A1[Softban]
+    T -- "yes, staff" --> I0
+    T -- no --> K{Image matches a<br/>known scam?}
+    K -- "yes, member" --> A2[Softban]
+    K -- "yes, staff" --> D[Delete and report,<br/>no punishment]
+    K -- no --> B{Same post in 3+ channels<br/>within 10 seconds?}
+    B -- "yes, member" --> A3[24-hour timeout]
+    B -- no --> N([Nothing happens])
+```
 
 | Rule | Catches | Default action |
 |---|---|---|
@@ -14,7 +53,7 @@ Every message runs through three rules, in this order.
 | Known scam image | An image whose fingerprint matches a stored scam image | softban |
 | Same post across channels | One post (same picture, or the same text or link) in 3 channels within 10 seconds | 24-hour timeout |
 
-A softban bans and immediately unbans. The member is removed and their last hour of messages is deleted, and they can rejoin once their account is secure.
+A softban bans and immediately unbans. The member is removed and their last hour of messages is deleted, and they can rejoin once their account is secure. Every action can be changed with `/scamguard config`.
 
 When ScamGuard acts on someone it:
 
@@ -71,16 +110,25 @@ The last row is why the seed in `seed_references.json` holds fingerprints of the
 
 ScamGuard needs its own application. It refuses to overwrite another bot's commands.
 
-At <https://discord.com/developers/applications>, create an application and fill in:
+At <https://discord.com/developers/applications>, create an application. The icon and profile banner are in `assets/`:
+
+<table>
+  <tr>
+    <td align="center"><img src="assets/logo.png" width="128" alt="ScamGuard icon"><br><code>assets/logo.png</code><br>App Icon and Bot Icon</td>
+    <td align="center"><img src="assets/banner.png" width="408" alt="ScamGuard profile banner"><br><code>assets/banner.png</code><br>Bot Banner</td>
+  </tr>
+</table>
+
+Then fill in:
 
 | Page | Field | Value |
 |---|---|---|
-| General Information | App Icon | `Logo.png` |
+| General Information | App Icon | `assets/logo.png` |
 | | Name, Description | ScamGuard, and a line about what it does on your server |
 | | Privacy Policy URL | your server's policy, if you have one |
 | Installation | Installation Contexts | Guild Install only |
 | | Install Link | None |
-| Bot | Icon, Banner | `Logo.png`, `Banner.png` |
+| Bot | Icon, Banner | `assets/logo.png`, `assets/banner.png` |
 | | Public Bot | off, so only you can add it to a server |
 | | Message Content Intent | on |
 | | Presence, Server Members | off |
