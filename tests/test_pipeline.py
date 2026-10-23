@@ -5,6 +5,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,30 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
         b.search_posts = mock.AsyncMock(return_value=[])  # Discord's search, faked
         self.guild = make_guild()
         return b
+
+    def restart(self, b):
+        """A new process: same settings and data folder, state read back from state.json."""
+        again = bot.ScamGuard(b.data_dir, b.settings, self.store, rules.State.load(b.data_dir / "state.json"))
+        again.report, again.forward = mock.AsyncMock(), mock.AsyncMock(return_value=None)
+        again.schedule_banner_update, again.search_posts = mock.Mock(), mock.AsyncMock(return_value=[])
+        return again
+
+    def gone(self):
+        """Someone who already left: Discord's member lookup answers Unknown Member."""
+        self.guild.get_member = lambda uid: None
+        self.guild.fetch_member = mock.AsyncMock(side_effect=discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"), {"code": 10007, "message": "Unknown Member"}))
+        self.guild.ban = mock.AsyncMock()
+        return FakeMember(id=50, bot=False, mention="<@50>", created_at=datetime(2016, 3, 18, tzinfo=timezone.utc))
+
+    def mod_click(self, b, perms=discord.Permissions(ban_members=True)):
+        """A moderator's button click, answered with a deferral and then an edit."""
+        done = []
+        response = SimpleNamespace(defer=mock.AsyncMock(side_effect=lambda *a, **k: done.append(1)),
+                                   is_done=lambda: bool(done))
+        return SimpleNamespace(client=b, guild_id=999, guild=self.guild, user=self.member(uid=60, perms=perms),
+                               response=response, message=SimpleNamespace(content="report"),
+                               edit_original_response=mock.AsyncMock())
 
     def member(self, uid=50, perms=None):
         def track(name):
@@ -148,7 +173,7 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
         m.send.assert_not_awaited()
         self.assertIn("DRY RUN", self.report_text(b))
         view = b.report.await_args.args[3]
-        self.assertEqual([c.custom_id for c in view.children], ["sg:apply:image:50:10:1"])
+        self.assertEqual([c.custom_id for c in view.children], ["sg:apply:image:softban:50:10:1"])
 
     async def test_broken_image_is_skipped_safely(self):
         b = self.make()
@@ -363,9 +388,29 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
         after = self.message(m, content="look https://example.com/x", image=True)
         b.fetch = mock.AsyncMock(return_value=self.scam)
         with mock.patch.object(bot.discord, "Member", FakeMember):
-            await b.on_message_edit(before, after)
+            await b.on_raw_message_edit(SimpleNamespace(message=after, cached_message=before))
         after.delete.assert_awaited_once()
         m.ban.assert_awaited_once()
+
+    async def test_edit_to_a_message_outside_the_cache_is_still_checked(self):
+        b = self.make()
+        m = self.member()
+        after = self.message(m, content="look https://example.com/x", image=True)
+        b.fetch = mock.AsyncMock(return_value=self.scam)
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await b.on_raw_message_edit(SimpleNamespace(message=after, cached_message=None))
+        after.delete.assert_awaited_once()
+        m.ban.assert_awaited_once()
+
+    async def test_edit_that_adds_no_image_downloads_nothing(self):
+        b = self.make()
+        m = self.member()
+        before = self.message(m, content="look", image=True)
+        after = self.message(m, content="look, edited", image=True)
+        b.fetch = mock.AsyncMock(return_value=self.scam)
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await b.on_raw_message_edit(SimpleNamespace(message=after, cached_message=before))
+        b.fetch.assert_not_awaited()
 
     async def test_cleanup_deletes_trap_posts_and_the_burst_but_not_later_chat(self):
         b = self.make()
@@ -391,8 +436,19 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
                                               [{"id": "2", "channel_id": "10", "author": {"id": "99"}}]]}])
         found = await bot.ScamGuard.search_posts(b, self.guild, 50, 1_800_000_000.0)
         self.assertEqual([m["id"] for m in found], ["1"])
-        params = b.http.request.await_args.kwargs["params"]
-        self.assertEqual((params["author_id"], params["limit"]), ("50", 25))
+        params = dict(b.http.request.await_args.kwargs["params"])
+        self.assertEqual((params["author_id"], params["limit"], params["sort_by"], params["sort_order"]),
+                         ("50", "25", "timestamp", "asc"))
+
+    async def test_search_pages_by_the_total_and_stops_at_the_cap(self):
+        b = self.make()
+        page = [[{"id": str(i), "channel_id": "10", "author": {"id": "50"}}] for i in range(3)]  # a short page
+        b.http.request = mock.AsyncMock(return_value={"total_results": 1000, "messages": page})
+        found = await b.search_messages(self.guild, [("has", "image")], 1_800_000_000.0, cap=100)
+        self.assertEqual(b.http.request.await_count, 4)  # 100 / 25 pages, though each page came back short
+        self.assertEqual(len(found), 12)
+        offsets = [dict(c.kwargs["params"])["offset"] for c in b.http.request.await_args_list]
+        self.assertEqual(offsets, ["0", "25", "50", "75"])
 
     async def test_queued_cleanup_survives_in_state_and_runs_when_due(self):
         b = self.make()
@@ -413,6 +469,201 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
             await bot.ScamGuard.report(b, self.guild, [f"**trap channel**: <@{m.id}> in <#{TRAP}>"], users={m.id: m})
         self.assertIn("@user50 (50)", logs.output[0])
         self.assertIn(f"#chan{TRAP} ({TRAP})", logs.output[0])
+
+    # ------------------------------------------------------ restarts and gaps
+    async def test_already_reported_survives_a_restart_but_not_a_rejoin(self):
+        b = self.make()
+        m = self.member()  # joined in 2023
+        await self.send(b, self.message(m, content="hi", channel_id=TRAP, mid=1))
+        b = self.restart(b)
+        again = self.message(m, content="still here", channel_id=TRAP, mid=2)
+        await self.send(b, again)
+        again.delete.assert_awaited_once()  # cleaned up quietly
+        self.assertEqual(m.ban.await_count, 1)
+        b.report.assert_not_awaited()
+        m.joined_at = datetime.now(timezone.utc)  # they rejoined after the catch: a new case
+        await self.send(b, self.message(m, content="back again", channel_id=TRAP, mid=3))
+        self.assertEqual(m.ban.await_count, 2)
+
+    async def test_every_new_session_catches_up_from_the_last_connected_minute(self):
+        b = self.make()
+        b.announce, b.catch_up = mock.AsyncMock(), mock.AsyncMock()
+        b.state.last_seen = 1000.0
+        with mock.patch.object(bot.ScamGuard, "guilds", new_callable=mock.PropertyMock, return_value=[self.guild]):
+            await b.on_ready()
+            b.catch_up.assert_awaited_once_with(self.guild, 1000.0)
+            await b.housekeep()
+            stamped = b.state.last_seen
+            self.assertGreater(stamped, 1000.0)
+            await b.on_disconnect()
+            await b.housekeep()  # disconnected: the stamp stays where the connection ended
+            self.assertEqual(b.state.last_seen, stamped)
+            await b.on_ready()   # Discord opened a new session instead of resuming the old one
+        self.assertEqual(b.catch_up.await_args.args, (self.guild, stamped))
+        b.announce.assert_awaited_once()
+
+    async def test_catch_up_bans_a_trap_poster_who_already_left(self):
+        b = self.make()
+        departed = self.gone()
+        msg = self.message(departed, content="hi", channel_id=TRAP, mid=7)
+
+        async def history(**kwargs):
+            yield msg
+        self.guild.get_channel_or_thread(TRAP).history = history
+        b.cleanup = mock.AsyncMock(return_value=0)
+        b.catch_up_images = mock.AsyncMock(return_value=(4, 0))
+        with self.assertLogs("scamguard", level="INFO") as logs:
+            await b.catch_up(self.guild, time.time() - 120)
+        self.assertIn("1 trap post(s), 4 image post(s) checked, 0 known scam(s)", "\n".join(logs.output))
+        msg.delete.assert_awaited_once()
+        self.assertEqual(self.guild.ban.await_args.args[0].id, 50)
+        self.guild.unban.assert_awaited_once()  # softban: purged, free to rejoin
+        text = self.report_text(b)
+        self.assertIn("left the server before ScamGuard saw this post", text)
+        self.assertIn("Softbanned by ID", text)
+        self.assertIn(7, b.state.handled)
+        b.catch_up_images.assert_awaited_once()
+
+    async def test_catch_up_checks_images_posted_while_offline(self):
+        b = self.make()
+        m = self.member()
+        self.guild.get_member = lambda uid: m if uid == 50 else None
+        msg = self.message(m, image=True, channel_id=10, mid=7)
+        b.search_messages = mock.AsyncMock(return_value=[{"id": "7", "channel_id": "10"},
+                                                         {"id": "8", "channel_id": str(TRAP)}])
+        b.fetch = mock.AsyncMock(return_value=self.scam)
+        with mock.patch.object(b._connection, "create_message", lambda *, channel, data: msg):
+            self.assertEqual(await b.catch_up_images(self.guild, time.time() - 120), (2, 1))
+        self.assertEqual(b.search_messages.await_args.args[1], [("has", "image"), ("author_type", "user")])
+        msg.delete.assert_awaited_once()
+        m.ban.assert_awaited_once()
+        self.assertEqual(b.fetch.await_count, 1)  # the trap channel's post was left to the history read
+        self.assertIn("known scam image", self.report_text(b))
+
+    async def test_take_action_applies_the_action_its_report_named(self):
+        b = self.make(dry_run=True)
+        m = self.member()
+        self.guild.get_member = lambda uid: m if uid == 50 else None
+        b.settings.honeypot_action = "ban"  # changed after the report went out
+        click = self.mod_click(b, discord.Permissions(ban_members=True, kick_members=True))
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await bot.ApplyButton("trap", 50, TRAP, 1, "kick").callback(click)
+        m.kick.assert_awaited_once()
+        m.ban.assert_not_awaited()
+
+    async def test_take_action_on_someone_who_left_bans_by_id(self):
+        b = self.make(dry_run=True)
+        self.gone()
+        b.cleanup = mock.AsyncMock(return_value=2)
+        button = bot.ApplyButton("trap", 50, TRAP, 1, "ban")
+        discord.ui.View(timeout=None).add_item(button)
+        click = self.mod_click(b)
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await button.callback(click)
+        self.assertEqual(self.guild.ban.await_args.args[0].id, 50)
+        edit = click.edit_original_response.await_args.kwargs
+        self.assertIn("They had already left. Banned by ID", edit["content"])
+        self.assertIn("Also deleted 2", edit["content"])
+        self.assertEqual([c.custom_id for c in edit["view"].children], ["sg:unban:50"])
+        self.assertEqual(b.state.totals, {"trap": 1})
+
+    async def test_take_action_changes_nothing_when_discord_cant_look_them_up(self):
+        b = self.make(dry_run=True)
+        self.gone()
+        self.guild.fetch_member.side_effect = discord.HTTPException(SimpleNamespace(status=503, reason="x"), "down")
+        b.delete = mock.AsyncMock(return_value=0)
+        click = self.mod_click(b)
+        click.followup = SimpleNamespace(send=mock.AsyncMock())
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await bot.ApplyButton("trap", 50, TRAP, 1, "ban").callback(click)
+        self.guild.ban.assert_not_awaited()  # an outage doesn't make them look like they left
+        b.delete.assert_not_awaited()
+        self.assertIn("nothing was done", click.followup.send.await_args.args[0])
+        self.assertEqual(b.state.totals, {})
+
+    # ------------------------------------------------- the safety brake, dry run
+    async def test_brake_on_means_no_dm_and_no_removal(self):
+        b = self.make()
+        b.state.braked.append(999)
+        m = self.member()
+        msg = self.message(m, image=True)
+        await self.send(b, msg, self.scam)
+        msg.delete.assert_awaited_once()
+        m.send.assert_not_awaited()  # 2.0 told them they were removed, then didn't remove them
+        m.ban.assert_not_awaited()
+        self.assertIn("Safety brake is on", self.report_text(b))
+
+    async def test_dry_run_never_deletes_after_a_live_catch(self):
+        b = self.make()
+        m = self.member()
+        await self.send(b, self.message(m, content="hi", channel_id=TRAP, mid=1))
+        b.settings.dry_run = True  # switched within the two minutes that follow a removal
+        late = self.message(m, content="a later post", channel_id=10, mid=2)
+        await self.send(b, late)
+        late.delete.assert_not_awaited()
+
+    async def test_failed_ban_lets_a_later_catch_try_again(self):
+        b = self.make()
+        m = self.member()
+        m.ban = mock.AsyncMock(side_effect=discord.HTTPException(SimpleNamespace(status=500, reason="x"), "boom"))
+        await self.send(b, self.message(m, content="hi", channel_id=TRAP, mid=1))
+        self.assertIn("failed (HTTP 500)", self.report_text(b))
+        b.condemned.clear()  # the two minutes of quiet deletes have passed
+        await self.send(b, self.message(m, content="again", channel_id=TRAP, mid=2))
+        self.assertEqual(m.ban.await_count, 2)
+        self.assertEqual(b.report.await_count, 2)
+
+    # ------------------------------------------------- downloads, labels, status
+    async def test_link_preview_download_is_tried_again(self):
+        b = self.make()
+        preview = bot.ImageSource("preview", ("https://images-ext-1.discordapp.net/external/x/https/a.example/p.png",),
+                                  (0.0, 0.0))
+        b.fetch = mock.AsyncMock(side_effect=[bot.DownloadError("HTTP 401", retry=True), self.scam])
+        with self.assertLogs("scamguard", level="INFO") as logs:
+            scan = await b.scan_one(preview, (), " from @user50 (50) in #c10 (10)")
+        self.assertIsNotNone(scan)
+        out = "\n".join(logs.output)
+        self.assertIn("failed (HTTP 401), trying again in 0s", out)
+        self.assertIn("downloaded on try 2", out)
+        self.assertIn("from @user50 (50) in #c10 (10)", out)
+        b.fetch = mock.AsyncMock(side_effect=bot.DownloadError("file too large"))
+        self.assertIsNone(await b.scan_one(preview, ()))
+        self.assertEqual(b.fetch.await_count, 1)  # another try can't fix that
+
+    async def test_fingerprint_label_names_the_channel_the_image_came_from(self):
+        b = self.make()
+        click = SimpleNamespace(client=b, guild=self.guild, user=self.member(uid=60))
+        msg = self.message(self.member(), image=True, channel_id=10, mid=5)
+        msg.jump_url = "https://discord.com/channels/999/10/5"
+        b.fetch = mock.AsyncMock(return_value=self.innocent)
+        _, added = await bot.learn_from(click, msg)
+        self.assertTrue(added)
+        self.assertEqual(self.store.refs[-1].label, "a.png from #chan10")
+        forward = self.message(self.member(), channel_id=5, mid=6)  # a copy forwarded into the log channel
+        forward.message_snapshots = [SimpleNamespace(attachments=[attachment(id=9)], embeds=[])]
+        forward.reference, forward.jump_url = SimpleNamespace(channel_id=20), "https://discord.com/channels/999/5/6"
+        b.fetch = mock.AsyncMock(return_value=jpeg(scene(79, (960, 1280))))
+        await bot.learn_from(click, forward)
+        self.assertEqual(self.store.refs[-1].label, "a.png from #chan20")
+
+    async def test_status_finds_reports_still_waiting_for_take_action(self):
+        b = self.make(log_channel_id=5)
+        b._connection.user = SimpleNamespace(id=1)
+
+        def post(author, mid, custom_ids):
+            return SimpleNamespace(author=SimpleNamespace(id=author), jump_url=f"https://discord.com/channels/999/5/{mid}",
+                                   components=[SimpleNamespace(children=[SimpleNamespace(custom_id=c) for c in custom_ids])])
+        waiting = post(1, 2, ["sg:apply:trap:softban:50:66:1"])
+        older = post(1, 3, ["sg:apply:trap:50:66:1"])  # posted by 2.0
+        posts = [waiting, post(1, 4, ["sg:unban:51"]), post(9, 5, ["sg:apply:trap:52:66:1"]), older]
+
+        async def history(**kwargs):
+            for p in posts:
+                yield p
+        log_channel = SimpleNamespace(id=5, history=history)
+        self.guild.get_channel_or_thread = lambda cid: log_channel
+        with mock.patch.object(bot.discord.abc, "Messageable", SimpleNamespace):
+            self.assertEqual(await b.pending_reviews(self.guild), [waiting.jump_url, older.jump_url])
 
     async def test_ignored_cases(self):
         cases = {

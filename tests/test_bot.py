@@ -1,6 +1,9 @@
 """Tests for URL safety, config, punishment, the safety brake and shared-token safety.
 Run from the project folder:  python3.13 -m unittest discover -s tests -v
 """
+import asyncio
+import io
+import logging
 import os
 import sys
 import tempfile
@@ -80,6 +83,8 @@ class Sources(unittest.TestCase):
         snap = SimpleNamespace(attachments=[attachment(id=2)], embeds=[])
         msg = SimpleNamespace(attachments=[attachment()], embeds=[embed], message_snapshots=[snap])
         self.assertEqual(len(bot.image_sources(msg)), 3)
+        # Only link previews get tried again: Discord's media proxy can refuse a new one for a few seconds.
+        self.assertEqual([s.retries for s in bot.image_sources(msg)], [(), (), bot.PREVIEW_RETRIES])
 
 
 class Startup(unittest.TestCase):
@@ -229,6 +234,63 @@ class Punishment(unittest.IsolatedAsyncioTestCase):
             fn.assert_not_awaited()
         self.assertFalse(out.applied)
 
+    async def test_brake_holds_when_catches_arrive_together(self):
+        b, g = make_bot(brake_limit=3), make_guild()
+        members = [make_member(g, uid=100 + i) for i in range(6)]
+
+        async def slow(**kwargs):
+            await asyncio.sleep(0.05)  # Discord takes a moment to answer
+        for m in members:
+            m.kick = mock.AsyncMock(side_effect=slow)
+        outs = await asyncio.gather(*(b.punish(m, "kick", "image") for m in members))
+        self.assertEqual(sum(m.kick.await_count for m in members), 3)
+        self.assertEqual(sum(o.braked for o in outs), 1)
+
+    async def test_brake_and_its_count_survive_a_restart(self):
+        b, g = make_bot(brake_limit=2), make_guild()
+        await b.punish(make_member(g, uid=100), "kick", "image")
+
+        def restarted():
+            return bot.ScamGuard(b.data_dir, b.settings, b.store, rules.State.load(b.data_dir / "state.json"))
+        later = restarted()
+        self.assertEqual(len(later.state.punishments), 1)
+        self.assertTrue((await later.punish(make_member(g, uid=101), "kick", "image")).braked)
+        again = restarted()
+        self.assertTrue(again.is_braked(999))
+        self.assertIn("Safety brake is on", (await again.punish(make_member(g, uid=102), "kick", "image")).text)
+        self.assertTrue(again.release_brake(999))
+        self.assertEqual(rules.State.load(b.data_dir / "state.json").braked, [])
+
+    async def test_removal_discord_refuses_is_taken_back_off_the_count(self):
+        b, g = make_bot(brake_limit=2), make_guild()
+        m = make_member(g)
+        m.kick.side_effect = discord.HTTPException(SimpleNamespace(status=500, reason="x"), "boom")
+        out = await b.punish(m, "kick", "image")
+        self.assertTrue(out.retry)
+        self.assertEqual(b.state.punishments, [])
+        m.kick.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "no")
+        out = await b.punish(m, "kick", "image")
+        self.assertFalse(out.retry)  # a missing permission stays missing
+        self.assertIn("missing permission", out.text)
+
+    async def test_someone_who_left_is_banned_by_id(self):
+        b, g = make_bot(), make_guild()
+        g.ban = mock.AsyncMock()
+        b.cleanup = mock.AsyncMock(return_value=3)
+        out = await b.punish_departed(g, 42, "ban", "image", 1234)
+        self.assertEqual(g.ban.await_args.args[0].id, 42)
+        self.assertEqual(g.ban.await_args.kwargs["delete_message_seconds"], 3600)
+        self.assertTrue(out.applied and out.banned)
+        self.assertIn("Also deleted 3", out.text)
+        g.unban.assert_not_awaited()
+        soft = await b.punish_departed(g, 43, "softban", "trap", 1234)
+        g.unban.assert_awaited_once()
+        self.assertFalse(soft.banned)
+        kick = await b.punish_departed(g, 44, "kick", "trap", 1234)
+        self.assertEqual(g.ban.await_count, 2)  # nothing to kick, but their posts are still cleared
+        self.assertIn("Nobody to kick", kick.text)
+        b.cleanup.assert_awaited_with(g, 44, 1234, "kick")
+
 
 class SharedTokenSafety(unittest.IsolatedAsyncioTestCase):
     """If someone reuses another bot's token, ScamGuard must not damage that bot."""
@@ -276,7 +338,7 @@ class SharedTokenSafety(unittest.IsolatedAsyncioTestCase):
         other.leave.assert_not_awaited()
         mine.leave.assert_not_awaited()
         b.announce.assert_awaited_once_with(mine)
-        b.catch_up.assert_awaited_once_with(mine)
+        b.catch_up.assert_awaited_once_with(mine, 0.0)
         await b.on_guild_join(other)
         other.leave.assert_not_awaited()
 
@@ -387,10 +449,10 @@ class SettingsCommands(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bot.is_moderator(it))  # status, list and check still work
             await bot.add_scam_image.callback(it, SimpleNamespace(id=1))
             self.assertIn("Ban Members", it.response.send_message.await_args.args[0])
-            b.braked.add(999)
+            b.state.braked.append(999)
             await bot.resume_cmd.callback(it)
             self.assertIn("Ban Members", it.response.send_message.await_args.args[0])
-        self.assertIn(999, b.braked)
+        self.assertTrue(b.is_braked(999))
 
     async def test_lists_need_manage_server(self):
         b = make_bot()
@@ -433,6 +495,68 @@ class SettingsCommands(unittest.IsolatedAsyncioTestCase):
             await bot.config_cmd.callback(it, rejoin_invite="auto")
             self.assertEqual(b.settings.rejoin_invite, "")
 
+    async def test_settings_changes_read_as_words_and_mentions(self):
+        b = make_bot(dry_run=True, log_channel_id=5)
+        b.report = mock.AsyncMock()
+        b.refresh_banners = mock.AsyncMock(return_value=[])
+        b.problems = lambda guild: []
+        it = admin_interaction(b, discord.Permissions(manage_guild=True))
+        role = SimpleNamespace(id=77, is_default=lambda: False)
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await bot.config_cmd.callback(it, mode=bot.app_commands.Choice(name="live", value="live"),
+                                          alert_role=role, timeout_hours=12, blast_channels=0)
+        lines = b.report.await_args_list[0].args[1]
+        for line in ("Mode: dry run → live", "Alert role: none → <@&77>", "Timeout: 24 hours → 12 hours",
+                     "Cross-channel rule: 3 channels → off"):
+            self.assertIn(line, lines)
+        self.assertNotIn("alert_role_id", "\n".join(lines))
+
+    async def test_remove_suggests_fingerprints_as_you_type(self):
+        b = make_bot()
+        b.store.refs = [scanner.Reference(hash=int("ab" * 32, 16), label="gift.png from #general"),
+                        scanner.Reference(hash=int("cd" * 32, 16), label="nitro.png from #help")]
+        it = admin_interaction(b, discord.Permissions(ban_members=True))
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            choices = await bot.fingerprint_choices(it, "NITRO")
+        self.assertEqual([c.value for c in choices], [b.store.refs[1].id])
+        self.assertIn("nitro.png from #help", choices[0].name)
+
+
+class Health(unittest.IsolatedAsyncioTestCase):
+    async def test_hourly_check_reports_only_what_changed(self):
+        b = make_bot()
+        b.report = mock.AsyncMock()
+        guild = SimpleNamespace(id=999)
+        problems = ["Missing permissions: Ban Members"]
+        b.problems = lambda g: list(problems)
+        b.problem_sets[999] = set(problems)
+        await b.recheck(guild)
+        b.report.assert_not_awaited()
+        problems[:] = ["The log channel <#5> was deleted, or I can't see it."]
+        await b.recheck(guild)
+        lines = b.report.await_args.args[1]
+        self.assertIn("⚠ New setup problem: The log channel <#5> was deleted, or I can't see it.", lines)
+        self.assertIn("✅ Fixed: Missing permissions: Ban Members", lines)
+
+
+class Logging(unittest.TestCase):
+    def test_routine_lines_go_to_stdout_and_problems_to_stderr(self):
+        root = logging.getLogger()
+        handlers, level = root.handlers[:], root.level
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+                bot.configure_logging(logging.INFO)
+                logging.getLogger("scamguard").info("routine line")
+                logging.getLogger("scamguard").warning("a problem")
+        finally:
+            root.handlers[:] = handlers
+            root.setLevel(level)
+        self.assertIn("routine line", out.getvalue())
+        self.assertNotIn("a problem", out.getvalue())
+        self.assertIn("a problem", err.getvalue())
+        self.assertNotIn("routine line", err.getvalue())
+
 
 class Banner(unittest.IsolatedAsyncioTestCase):
     async def test_banner_is_components_v2_with_the_count_button(self):
@@ -455,9 +579,18 @@ class Buttons(unittest.TestCase):
     def test_custom_ids_fit_and_round_trip(self):
         big = 2 ** 63 - 1  # largest possible snowflake
         for item in (bot.UnbanButton(big), bot.UntimeoutButton(big), bot.ApplyButton("blast", big, big, big),
-                     bot.LearnButton(big, big), bot.StatsButton(12345)):
+                     bot.ApplyButton("image", big, big, big, "softban"), bot.LearnButton(big, big),
+                     bot.StatsButton(12345)):
             self.assertLessEqual(len(item.custom_id), 100)
             self.assertIsNotNone(item.template.fullmatch(item.custom_id))
+
+    def test_take_action_carries_its_action_and_still_reads_older_buttons(self):
+        new = bot.ApplyButton("image", 1, 2, 3, "kick")
+        self.assertEqual(new.custom_id, "sg:apply:image:kick:1:2:3")
+        m = new.template.fullmatch(new.custom_id)
+        self.assertEqual((m["rule"], m["action"], m["uid"], m["mid"]), ("image", "kick", "1", "3"))
+        old = new.template.fullmatch("sg:apply:trap:1:2:3")  # posted by 2.0
+        self.assertEqual((old["rule"], old["action"], old["uid"], old["mid"]), ("trap", None, "1", "3"))
 
 
 if __name__ == "__main__":

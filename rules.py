@@ -254,8 +254,8 @@ class Settings:
 class State:
     """Counters and bookkeeping that survive restarts. Saved to state.json.
 
-    Holds no message text and no member IDs, only catch times and the IDs of
-    ScamGuard's own banner messages and of trap messages already handled.
+    Holds no message text. Member IDs stay only as long as they're needed: who
+    was reported in the last 10 minutes, and whose cleanup is still due.
     """
 
     totals: dict[str, int] = field(default_factory=dict)       # rule -> catches since install
@@ -264,6 +264,9 @@ class State:
     handled: list[int] = field(default_factory=list)           # trap message IDs already acted on
     last_seen: float = 0.0                                     # unix time, stamped every minute
     cleanups: list[list] = field(default_factory=list)         # [guild, member, caught message, action, due unix time]
+    reported: dict[str, float] = field(default_factory=dict)   # "guild:member" -> unix time they were last reported
+    braked: list[int] = field(default_factory=list)            # guilds whose safety brake is engaged
+    punishments: list[list] = field(default_factory=list)      # [guild, unix time] of image and cross-channel removals
 
     MAX_RECENT = 2000
     MAX_HANDLED = 500
@@ -284,7 +287,8 @@ class State:
 
     def to_json(self) -> dict:
         return {"totals": self.totals, "recent": self.recent, "banners": self.banners,
-                "handled": self.handled, "last_seen": self.last_seen, "cleanups": self.cleanups}
+                "handled": self.handled, "last_seen": self.last_seen, "cleanups": self.cleanups,
+                "reported": self.reported, "braked": self.braked, "punishments": self.punishments}
 
     @classmethod
     def load(cls, path: Path) -> "State":
@@ -300,6 +304,9 @@ class State:
             handled=[int(m) for m in list(data.get("handled", []))][-cls.MAX_HANDLED:],
             last_seen=float(data.get("last_seen", 0.0)),
             cleanups=[[int(g), int(u), int(m), str(a), float(d)] for g, u, m, a, d in list(data.get("cleanups", []))],
+            reported={str(k): float(v) for k, v in dict(data.get("reported", {})).items()},
+            braked=[int(g) for g in list(data.get("braked", []))],
+            punishments=[[int(g), float(t)] for g, t in list(data.get("punishments", []))],
         )
         return state
 
