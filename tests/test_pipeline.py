@@ -2,7 +2,6 @@
 Only Discord's network calls are faked. Run:  python3.13 -m unittest discover -s tests -v
 """
 import io
-import os
 import sys
 import tempfile
 import time
@@ -304,6 +303,48 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Deleted 3 of 3", text)
         view = b.report.await_args.args[3]
         self.assertEqual([c.custom_id for c in view.children], ["sg:untimeout:50"])
+
+    async def test_harmless_posts_edited_into_the_same_scam_are_caught(self):
+        b = self.make()
+        m = self.member()
+        originals = [self.message(m, content=f"a harmless long message, number {i}", channel_id=c, mid=i)
+                     for i, c in enumerate((10, 11, 12), start=1)]
+        for msg in originals:
+            await self.send(b, msg)
+        b.report.assert_not_awaited()
+        for before in originals:
+            after = self.message(m, content="Free nitro, claim it at https://scam.example/n",
+                                 channel_id=before.channel.id, mid=before.id)
+            after.edited_at = datetime.now(timezone.utc)
+            with mock.patch.object(bot.discord, "Member", FakeMember):
+                await b.on_raw_message_edit(SimpleNamespace(message=after, cached_message=before))
+        m.timeout.assert_awaited_once()
+        text = self.report_text(b)
+        self.assertIn("same post across channels", text)
+        self.assertIn("Deleted 3 of 3", text)
+
+    async def test_one_message_edited_again_and_again_is_not_a_blast(self):
+        b = self.make()
+        m = self.member()
+        before = self.message(m, content="a harmless long message to start", channel_id=10, mid=1)
+        await self.send(b, before)
+        for i in range(5):
+            after = self.message(m, content=f"Free nitro for everyone, claim it here {i}", channel_id=10, mid=1)
+            after.edited_at = datetime.now(timezone.utc)
+            with mock.patch.object(bot.discord, "Member", FakeMember):
+                await b.on_raw_message_edit(SimpleNamespace(message=after, cached_message=before))
+            before = after
+        m.timeout.assert_not_awaited()
+        self.assertEqual(len(b.blasts.posts[(999, 50)]), 1)
+
+    async def test_pins_and_link_previews_are_not_edits(self):
+        b = self.make()
+        b.inspect = mock.AsyncMock()
+        msg = self.message(self.member(), content="Free nitro for everyone, claim it here")
+        msg.edited_at = None  # Discord leaves it unset for a pin or a preview arriving
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            await b.on_raw_message_edit(SimpleNamespace(message=msg, cached_message=None))
+        b.inspect.assert_not_awaited()
 
     async def test_short_replies_in_three_channels_are_fine(self):
         b = self.make()

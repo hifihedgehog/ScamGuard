@@ -69,6 +69,25 @@ class Blast(unittest.TestCase):
                 t = rules.BlastTracker()
                 self.assertTrue(all(t.record(KEY, p, 3, 10) is None for p in posts))
 
+    def test_an_edit_replaces_its_message_instead_of_adding_one(self):
+        t = rules.BlastTracker()
+        scam = "Free nitro for everyone, claim it here"
+        for i in range(5):  # one message edited again and again is one channel
+            self.assertIsNone(t.record(KEY, post(i, 10, 1, f"{scam} {'!' * i}"), 3, 10))
+        self.assertEqual(len(t.posts[KEY]), 1)
+        t.record(KEY, post(5, 11, 2, "a harmless long message, nothing to see"), 3, 10)
+        t.record(KEY, post(6, 11, 2, scam), 3, 10)  # message 2 edited into the scam
+        self.assertIsNone(t.record(KEY, post(6.5, 10, 1, scam), 3, 10))  # message 1 settles on it too
+        same = t.record(KEY, post(7, 12, 3, scam), 3, 10)
+        self.assertEqual(sorted(p.message_id for p in same), [1, 2, 3])
+
+    def test_judged_by_discords_times_not_arrival_order(self):
+        t = rules.BlastTracker()
+        text = "the same long message again"
+        # Posted a minute apart, delivered together after a reconnect, newest first.
+        for at, channel, mid in ((120, 12, 3), (60, 11, 2), (0, 10, 1)):
+            self.assertIsNone(t.record(KEY, post(at, channel, mid, text), 3, 10))
+
     def test_off_when_channels_below_two(self):
         t = rules.BlastTracker()
         self.assertIsNone(t.record(KEY, post(0, 10, 1, "the same long message again"), 0, 10))

@@ -59,7 +59,7 @@ flowchart TD
 |---|---|---|
 | Trap channel | Any post by a non-staff member in a trap channel, or in a thread they started under one | softban |
 | Known scam image | An image whose fingerprint matches a stored scam image | softban |
-| Same post across channels | One post (same picture, or the same text or link) in 3 channels within 10 seconds | 24-hour timeout |
+| Same post across channels | One post (same picture, or the same text or link) in 3 channels within 10 seconds, whether posted that way or edited into it | 24-hour timeout |
 
 A softban bans and immediately unbans. The member is removed and their last hour of messages is deleted, and they can rejoin once their account is secure. Every action can be changed with `/scamguard config`.
 
@@ -92,7 +92,7 @@ Take action buttons on dry-run reports also work after a restart. Each carries t
 | Warning banner with catch count | yes | image banner | yes |
 | Forwards the spam to the log | optional | re-hosts up to 4 images | always |
 | DM with account-recovery steps | yes | only with appeals | yes, with a rejoin link |
-| Same message across channels | no | text and file names only (link-only posts slip through) | pictures by fingerprint, text, and links |
+| Same message across channels | no | text and file names only (link-only posts slip through) | pictures by fingerprint, text, and links, including edits |
 | Known scam images | no | no | yes, seeded with 8 real spam files |
 | Cleans up the rest of the spammer's posts | only with its search-based cleanup turned on | scans the last 30 messages of every channel | deletes the messages it saw them post, then searches for the rest |
 | Posts made while the bot was down | no | replays trap posts | replays trap posts and checks every image |
@@ -261,7 +261,7 @@ All of these change with `/scamguard config`.
 | `alert_role` | none | Pinged when the safety brake engages. Pick @everyone to turn it off |
 | `brake_limit` / `brake_minutes` | 5 / 10 | Image or cross-channel removals that pause those two rules until `/scamguard resume` |
 
-The cross-channel window is short because speed is the signal. MadHoney uses 5 seconds for the same check. If blasts start arriving more slowly, raise `blast_seconds`. Text under 12 characters with no link never counts, so "thanks!" in three channels is fine.
+The cross-channel window is short because speed is the signal. MadHoney uses 5 seconds for the same check. If blasts start arriving more slowly, raise `blast_seconds`. Text under 12 characters with no link never counts, so "thanks!" in three channels is fine. The window runs on Discord's timestamps, so messages that reach ScamGuard together after a reconnect are judged by when they were posted.
 
 ## Security
 

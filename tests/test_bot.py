@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -85,6 +85,19 @@ class Sources(unittest.TestCase):
         self.assertEqual(len(bot.image_sources(msg)), 3)
         # Only link previews get tried again: Discord's media proxy can refuse a new one for a few seconds.
         self.assertEqual([s.retries for s in bot.image_sources(msg)], [(), (), bot.PREVIEW_RETRIES])
+
+
+class Edits(unittest.TestCase):
+    def test_only_a_fresh_text_change_counts_as_an_edit(self):
+        now = datetime.now(timezone.utc)
+
+        def msg(text, edited_at=None):
+            return SimpleNamespace(content=text, edited_at=edited_at)
+        self.assertTrue(bot.text_edited(msg("old text"), msg("new text", now)))
+        self.assertTrue(bot.text_edited(None, msg("new text", now)))  # the old version wasn't cached
+        self.assertFalse(bot.text_edited(msg("same text"), msg("same text", now)))  # a preview after an edit
+        self.assertFalse(bot.text_edited(None, msg("pinned")))  # no stamp: a pin or a preview
+        self.assertFalse(bot.text_edited(None, msg("edited long ago", now - timedelta(hours=1))))
 
 
 class Startup(unittest.TestCase):

@@ -88,13 +88,20 @@ class BlastTracker:
         self.posts: dict[tuple[int, int], deque[Post]] = {}
 
     def record(self, key: tuple[int, int], post: Post, channels: int, seconds: float) -> list[Post] | None:
+        """Add a post and return the posts that make a blast with it, if any: the same post in
+        `channels` distinct channels within `seconds` of it. A post with the message ID of one
+        already held is an edit, and replaces it. `at` is Discord's time for the post or edit,
+        so posts that reach the bot in a burst, as missed events do after a reconnect, are
+        judged by when they were made."""
         if channels < 2 or not post.comparable():
             return None
-        q = self.posts.setdefault(key, deque(maxlen=self.PER_MEMBER))
-        while q and post.at - q[0].at > seconds:
-            q.popleft()
+        held = self.posts.get(key, ())
+        newest = max([post.at, *(p.at for p in held)])
+        q = deque([p for p in held if p.message_id != post.message_id and newest - p.at <= seconds],
+                  maxlen=self.PER_MEMBER)
         q.append(post)
-        same = [p for p in q if same_post(p, post)]
+        self.posts[key] = q
+        same = [p for p in q if same_post(p, post) and abs(p.at - post.at) <= seconds]
         if len({p.channel_id for p in same}) < channels:
             return None
         rest = [p for p in q if p not in same]

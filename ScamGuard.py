@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 import rules
 import scanner
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 log = logging.getLogger("scamguard")
 HERE = Path(__file__).resolve().parent
 SEED_FILE = HERE / "seed_references.json"
@@ -47,6 +47,7 @@ MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
 SCAN_TIMEOUT = 30        # seconds per image (download + fingerprint)
 SCAN_CONCURRENCY = 4     # images processed at once, so a flood can't exhaust memory/CPU
 REPEAT_WINDOW = 600      # act on the same member at most once per 10 minutes
+EDIT_FRESH = 300         # an edit stamped this recently is the author changing the text now
 CONDEMN_SECONDS = 120    # after a removal, delete anything else the account posts for 2 minutes
 QUICK_SWEEP = 120        # seconds of a removed member's recent posts deleted at minimum
 NEAR_MISS_MARGIN = 24    # console-log images that came this close to the threshold
@@ -55,7 +56,9 @@ FORWARD_TIMEOUT = 5.0
 BANNER_INTERVAL = 10.0   # edit trap banners at most this often
 CATCHUP_WINDOW = 24 * 3600
 CATCHUP_MAX = 500        # trap posts read back per channel, and image posts checked, after downtime
-PREVIEW_RETRIES = (3.0, 12.0)  # Discord's media proxy can refuse a new link preview for a few seconds
+# Discord's media proxy answers 401 for some new link previews for a while (one on 2026-10-23 still
+# did 15 seconds in, and served fine later), so a failed preview gets tried again on this backoff.
+PREVIEW_RETRIES = (3.0, 12.0, 30.0, 60.0, 120.0)
 HEALTH_MINUTES = 60      # the setup check runs again this often and reports what changed
 MEDIA_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 EXTERNAL_PROXY = re.compile(r"images-ext-\d+\.discordapp\.net")
@@ -80,6 +83,16 @@ def snowflake_at(unix: float) -> int:
 
 def snowflake_time(snowflake: int) -> float:
     return ((snowflake >> 22) + DISCORD_EPOCH_MS) / 1000
+
+
+def text_edited(before, after) -> bool:
+    """True when this update is the author changing the text. Discord stamps edited_at only for
+    that: a link preview arriving or a pin leaves it unset. Without the old version to compare,
+    a fresh stamp is the only sign."""
+    stamp = getattr(after, "edited_at", None)
+    if stamp is None or time.time() - stamp.timestamp() > EDIT_FRESH:
+        return False
+    return before is None or rules.normalize_text(before.content) != rules.normalize_text(after.content)
 
 
 def who(user) -> str:
@@ -369,7 +382,9 @@ class ScamGuard(discord.Client):
         st.punishments = [[g, t] for g, t in st.punishments if wall - t <= brake_window]
         self.save_state()
         await self.run_cleanups()
-        self.blasts.prune(now, self.settings.blast_seconds)
+        # The tracker holds Discord's times, so it's trimmed by the wall clock, with a minute of slack
+        # in case this machine's clock and Discord's disagree.
+        self.blasts.prune(wall, self.settings.blast_seconds + 60)
         self.recent.prune(now)
         self.condemned = {k: t for k, t in self.condemned.items() if t > now}
         self.minutes += 1
@@ -716,8 +731,10 @@ class ScamGuard(discord.Client):
         if before is not None:  # only the images this update added. Without the old version, all of them.
             seen = {url for s in image_sources(before) for url in s.urls}
             sources = [s for s in sources if not seen.intersection(s.urls)]
-        if sources:
-            await self.inspect(after, sources, edited=True)
+        # Harmless posts edited into the same scam across channels count like the scam posted there.
+        changed = text_edited(before, after)
+        if sources or changed:
+            await self.inspect(after, sources, edited=True, text_changed=changed)
 
     def staff_role(self, role: discord.Role) -> bool:
         return role.id in self.settings.exempt_role_ids or any(getattr(role.permissions, p) for p in STAFF_PERMS)
@@ -729,7 +746,10 @@ class ScamGuard(discord.Client):
                 or any(r.id in self.settings.exempt_role_ids for r in member.roles))
 
     async def inspect(self, message: discord.Message, sources: list[ImageSource], *,
-                      member: discord.Member | None = None, edited: bool = False) -> None:
+                      member: discord.Member | None = None, edited: bool = False,
+                      text_changed: bool = False) -> None:
+        """Run the rules on a post. An update (edited=True) skips the trap rule, which a post meets
+        when it's made, and meets the cross-channel rule only when its author changed the text."""
         guild, s = message.guild, self.settings
         member = member or message.author  # type: ignore[assignment]
         if self.ignored(message.channel):
@@ -746,7 +766,7 @@ class ScamGuard(discord.Client):
                 await self.enforce(message, member, "trap", f"posted in {channel.mention}, a trap channel", [])
             return
 
-        check_blast = not edited and not staff and s.blast_channels >= 2
+        check_blast = (not edited or text_changed) and not staff and s.blast_channels >= 2
         text = rules.normalize_text(message.content) if check_blast else ""
         if not sources and not (check_blast and rules.meaningful_text(text)):
             return
@@ -762,8 +782,11 @@ class ScamGuard(discord.Client):
                 log.info("Near miss%s: %r scored %d against fingerprint %s %r (threshold %d)", context,
                          scan.source.name[:80], near[1], near[0].id, near[0].label[:60], s.match_threshold)
         if check_blast:
-            post = rules.Post(time.monotonic(), message.channel.id, message.id, text,
-                              tuple(scan.fp.full for scan in scans))
+            # Discord's time for the post or the edit, so a burst of events delivered late (after a
+            # reconnect, say) is judged by when they happened, not by when they arrived.
+            stamp = getattr(message, "edited_at", None) if edited else None
+            at = stamp.timestamp() if stamp else snowflake_time(message.id)
+            post = rules.Post(at, message.channel.id, message.id, text, tuple(scan.fp.full for scan in scans))
             same = self.blasts.record((guild.id, member.id), post, s.blast_channels, s.blast_seconds)
             if same:
                 channels = len({p.channel_id for p in same})
