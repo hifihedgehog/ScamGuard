@@ -263,6 +263,7 @@ class State:
     banners: dict[str, int] = field(default_factory=dict)      # trap channel ID -> banner message ID
     handled: list[int] = field(default_factory=list)           # trap message IDs already acted on
     last_seen: float = 0.0                                     # unix time, stamped every minute
+    cleanups: list[list] = field(default_factory=list)         # [guild, member, caught message, action, due unix time]
 
     MAX_RECENT = 2000
     MAX_HANDLED = 500
@@ -283,7 +284,7 @@ class State:
 
     def to_json(self) -> dict:
         return {"totals": self.totals, "recent": self.recent, "banners": self.banners,
-                "handled": self.handled, "last_seen": self.last_seen}
+                "handled": self.handled, "last_seen": self.last_seen, "cleanups": self.cleanups}
 
     @classmethod
     def load(cls, path: Path) -> "State":
@@ -298,6 +299,7 @@ class State:
             banners={str(k): int(v) for k, v in dict(data.get("banners", {})).items()},
             handled=[int(m) for m in list(data.get("handled", []))][-cls.MAX_HANDLED:],
             last_seen=float(data.get("last_seen", 0.0)),
+            cleanups=[[int(g), int(u), int(m), str(a), float(d)] for g, u, m, a, d in list(data.get("cleanups", []))],
         )
         return state
 

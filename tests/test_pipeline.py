@@ -59,6 +59,7 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
         b.report = mock.AsyncMock()
         b.forward = mock.AsyncMock(return_value=None)
         b.schedule_banner_update = mock.Mock()
+        b.search_posts = mock.AsyncMock(return_value=[])  # Discord's search, faked
         self.guild = make_guild()
         return b
 
@@ -365,6 +366,53 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
             await b.on_message_edit(before, after)
         after.delete.assert_awaited_once()
         m.ban.assert_awaited_once()
+
+    async def test_cleanup_deletes_trap_posts_and_the_burst_but_not_later_chat(self):
+        b = self.make()
+        caught = 1_800_000_000.0
+        def post(channel, offset):
+            return {"id": str(bot.snowflake_at(caught + offset)), "channel_id": str(channel), "author": {"id": "50"}}
+        keep_later, keep_old = post(10, 2700), post(10, -7200)
+        b.search_posts = mock.AsyncMock(return_value=[post(TRAP, 3600), post(10, -1800), post(10, 60), keep_later, keep_old])
+        deleted = []
+        self.guild.get_channel_or_thread = lambda cid: SimpleNamespace(
+            id=cid, get_partial_message=lambda mid: SimpleNamespace(id=mid, delete=mock.AsyncMock(
+                side_effect=lambda *a, **k: deleted.append(mid))))
+        n = await b.cleanup(self.guild, 50, bot.snowflake_at(caught), "softban")
+        self.assertEqual(n, 3)
+        self.assertNotIn(int(keep_later["id"]), deleted)
+        self.assertNotIn(int(keep_old["id"]), deleted)
+
+    async def test_search_waits_out_indexing_and_keeps_only_the_author(self):
+        b = self.make()
+        b.http.request = mock.AsyncMock(side_effect=[
+            {"retry_after": 0},
+            {"total_results": 2, "messages": [[{"id": "1", "channel_id": "10", "author": {"id": "50"}}],
+                                              [{"id": "2", "channel_id": "10", "author": {"id": "99"}}]]}])
+        found = await bot.ScamGuard.search_posts(b, self.guild, 50, 1_800_000_000.0)
+        self.assertEqual([m["id"] for m in found], ["1"])
+        params = b.http.request.await_args.kwargs["params"]
+        self.assertEqual((params["author_id"], params["limit"]), ("50", 25))
+
+    async def test_queued_cleanup_survives_in_state_and_runs_when_due(self):
+        b = self.make()
+        b.queue_cleanup(999, 50, 1234, "softban")
+        saved = rules.State.load(Path(self.tmp.name) / "state.json")
+        self.assertEqual(saved.cleanups[0][:4], [999, 50, 1234, "softban"])
+        b.state.cleanups[0][4] = 0  # due now
+        b.cleanup = mock.AsyncMock(return_value=2)
+        b.get_guild = lambda gid: self.guild
+        await b.run_cleanups()
+        b.cleanup.assert_awaited_once_with(self.guild, 50, 1234, "softban")
+        self.assertEqual(b.state.cleanups, [])
+
+    async def test_console_log_names_members_and_channels(self):
+        b = self.make()
+        m = self.member()
+        with self.assertLogs("scamguard", level="INFO") as logs:
+            await bot.ScamGuard.report(b, self.guild, [f"**trap channel**: <@{m.id}> in <#{TRAP}>"], users={m.id: m})
+        self.assertIn("@user50 (50)", logs.output[0])
+        self.assertIn(f"#chan{TRAP} ({TRAP})", logs.output[0])
 
     async def test_ignored_cases(self):
         cases = {

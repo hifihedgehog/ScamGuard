@@ -26,7 +26,7 @@ It was built for a 43,000-member server to replace two bots, [Honeypot](https://
 |---|---|
 | Copies of real scam images matched | 84 of 84, all within 14 of 256 bits |
 | Member uploads matched by mistake | 0 of 601, the closest 92 bits away |
-| Tests, on every push | 93, on Python 3.11, 3.12 and 3.13 |
+| Tests, on every push | 97, on Python 3.11, 3.12 and 3.13 |
 
 ## What it catches
 
@@ -274,7 +274,7 @@ Message text and images are processed in memory and discarded. In `data/`, ScamG
 python3 -m unittest discover -s tests -v
 ```
 
-93 tests cover image decoding safety, fingerprints, the reference store, the cross-channel tracker, settings and the commands that change them, binding to one server, the three rules end to end, the DM order, the review button, and shared-token safety.
+97 tests cover image decoding safety, fingerprints, the reference store, the cross-channel tracker, settings and the commands that change them, binding to one server, the three rules end to end, the DM order, the review button, and shared-token safety.
 
 ## Credits
 

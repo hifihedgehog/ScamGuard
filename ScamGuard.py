@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 import rules
 import scanner
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 log = logging.getLogger("scamguard")
 HERE = Path(__file__).resolve().parent
 SEED_FILE = HERE / "seed_references.json"
@@ -61,6 +61,29 @@ RULE_NAMES = {"trap": "trap channel", "image": "known scam image", "blast": "sam
 PERM_FOR_ACTION = {"delete": "manage_messages", "timeout": "moderate_members", "kick": "kick_members",
                    "softban": "ban_members", "ban": "ban_members"}
 BANNER_COLOR = 0xF5A623
+DISCORD_EPOCH_MS = 1420070400000
+SEARCH_DELAY = 90        # Discord's message search indexes new posts within about a minute
+SEARCH_PAGE = 25         # the search endpoint's largest page
+SEARCH_MAX = 250         # never page past this many results for one member
+TRAP_LOOKBACK = 600      # trap posts this long before the catch are deleted too
+MENTION_RE = re.compile(r"<(@!?|@&|#)(\d+)>")
+
+
+def snowflake_at(unix: float) -> int:
+    return max(0, int(unix * 1000) - DISCORD_EPOCH_MS) << 22
+
+
+def snowflake_time(snowflake: int) -> float:
+    return ((snowflake >> 22) + DISCORD_EPOCH_MS) / 1000
+
+
+def who(user) -> str:
+    """A member as the console log shows them: name and ID."""
+    return f"@{user} ({user.id})"
+
+
+def where(channel) -> str:
+    return f"#{getattr(channel, 'name', '?')} ({getattr(channel, 'id', '?')})"
 
 
 # ======================================================================= config
@@ -323,6 +346,7 @@ class ScamGuard(discord.Client):
                 now = time.monotonic()
                 self.state.last_seen = time.time()
                 self.save_state()
+                await self.run_cleanups()
                 self.blasts.prune(now, self.settings.blast_seconds)
                 self.recent.prune(now)
                 self.handled_at = {k: t for k, t in self.handled_at.items() if now - t < REPEAT_WINDOW}
@@ -543,15 +567,15 @@ class ScamGuard(discord.Client):
                         if not self.settings.dry_run:
                             await self.delete([msg])
                         continue
-                    log.info("Catch-up: trap post %s by %s while offline", msg.id, msg.author.id)
+                    log.info("Catch-up: %s posted in %s while ScamGuard was offline", who(msg.author), where(channel))
                     await self.inspect(msg, [], member=member)
             except discord.HTTPException as exc:
-                log.warning("Catch-up in %s failed (HTTP %s)", cid, exc.status)
+                log.warning("Catch-up in %s failed (HTTP %s)", where(channel), exc.status)
 
     # ------------------------------------------------------------- detection
     def in_trap(self, channel) -> bool:
-        where = {getattr(channel, "id", None), getattr(channel, "parent_id", None)}
-        return bool(where & set(self.settings.honeypot_channel_ids))
+        places = {getattr(channel, "id", None), getattr(channel, "parent_id", None)}
+        return bool(places & set(self.settings.honeypot_channel_ids))
 
     async def on_message(self, message: discord.Message) -> None:
         guild = message.guild
@@ -574,7 +598,7 @@ class ScamGuard(discord.Client):
         key, now = (guild.id, message.author.id), time.monotonic()
         if self.condemned.get(key, 0) > now:
             await self.delete([message])
-            log.info("Deleted a late post %s from %s, who was just removed", message.id, message.author.id)
+            log.info("Deleted a late post by %s in %s, who was just removed", who(message.author), where(message.channel))
             return
         self.recent.add(key, now, message.channel.id, message.id)
         await self.inspect(message, image_sources(message))
@@ -600,15 +624,15 @@ class ScamGuard(discord.Client):
                       member: discord.Member | None = None, edited: bool = False) -> None:
         guild, s = message.guild, self.settings
         member = member or message.author  # type: ignore[assignment]
-        where = {message.channel.id, getattr(message.channel, "parent_id", None)}
-        if where & {*s.exempt_channel_ids, s.log_channel_id}:
+        places = {message.channel.id, getattr(message.channel, "parent_id", None)}
+        if places & {*s.exempt_channel_ids, s.log_channel_id}:
             return
         staff = self.is_staff(member)
-        if not edited and where & set(s.honeypot_channel_ids):
+        if not edited and places & set(s.honeypot_channel_ids):
             channel = message.channel
             in_thread = channel.id not in s.honeypot_channel_ids  # a thread under a trap channel
             if staff:
-                log.info("Staff member %s posted in trap channel %s; ignored", member.id, channel.id)
+                log.info("Staff member %s posted in trap channel %s; ignored", who(member), where(channel))
             elif in_thread and getattr(channel, "owner_id", None) != member.id:
                 await self.bait_thread(message, member)
             else:
@@ -774,7 +798,8 @@ class ScamGuard(discord.Client):
         try:
             return await asyncio.wait_for(message.forward(channel), FORWARD_TIMEOUT)
         except (discord.HTTPException, TimeoutError) as exc:
-            log.warning("Couldn't forward message %s to the log channel: %s", message.id, exc)
+            log.warning("Couldn't forward %s's post in %s to the log channel: %s", who(message.author),
+                        where(message.channel), exc)
             return None
 
     async def enforce(self, message: discord.Message, member: discord.Member, rule: str, detail: str,
@@ -788,8 +813,8 @@ class ScamGuard(discord.Client):
                 # Another post from someone already handled: clean up quietly, no second report.
                 if not s.dry_run:
                     await self.delete([message, *also_delete])
-                log.info("Already handled %s; %s post %s", member.id,
-                         "would delete" if s.dry_run else "deleted", message.id)
+                log.info("Already handled %s: %s their post in %s", who(member),
+                         "would delete" if s.dry_run else "deleted", where(message.channel))
                 return
             self.handled_at[key] = now
             if not s.dry_run and action != "delete":
@@ -808,7 +833,7 @@ class ScamGuard(discord.Client):
             if not staff and action != "delete":
                 view = discord.ui.View(timeout=None)
                 view.add_item(ApplyButton(rule, member.id, message.channel.id, message.id))
-            await self.report(guild, lines, self.evidence(scans, forwarded), view)
+            await self.report(guild, lines, self.evidence(scans, forwarded), view, users={member.id: member})
             self.save_state()
             return
 
@@ -824,6 +849,7 @@ class ScamGuard(discord.Client):
             swept = await self.sweep(guild, member.id, action, {message.id, *(m.id for m in also_delete)})
             if swept:
                 lines.append(f"Also deleted {swept} other recent message(s) of theirs.")
+            self.queue_cleanup(guild.id, member.id, message.id, action)
         if dm_sent is not None:
             lines.append("They were sent a DM explaining why." if dm_sent else "The DM didn't go through.")
         if forwarded is not None:
@@ -837,7 +863,7 @@ class ScamGuard(discord.Client):
         if rule != "image" and forwarded is not None and image_sources(forwarded):
             view.add_item(LearnButton(forwarded.channel.id, forwarded.id))
         await self.report(guild, lines, self.evidence(scans, forwarded), view if view.children else None,
-                          ping=outcome.braked)
+                          ping=outcome.braked, users={member.id: member})
         if not staff:
             self.state.record_catch(rule)
         self.save_state()
@@ -850,7 +876,7 @@ class ScamGuard(discord.Client):
 
     async def dm(self, member: discord.Member, rule: str, action: str, channel) -> bool:
         if not self.dm_limit.allow():
-            log.info("DM rate limit reached; not messaging %s", member.id)
+            log.info("DM rate limit reached; not messaging %s", who(member))
             return False
         # Name the parent channel, never a thread: anyone can title a thread, including with a link.
         # Only letters, digits, hyphens and underscores survive, so no name can form a link.
@@ -873,7 +899,8 @@ class ScamGuard(discord.Client):
             except discord.NotFound:
                 done += 1  # already gone
             except discord.HTTPException as exc:
-                log.warning("Couldn't delete message %s (HTTP %s)", msg.id, exc.status)
+                log.warning("Couldn't delete message %s in %s (HTTP %s)", msg.id, where(getattr(msg, "channel", None)),
+                            exc.status)
         return done
 
     async def sweep(self, guild: discord.Guild, member_id: int, action: str, skip: set[int]) -> int:
@@ -884,6 +911,77 @@ class ScamGuard(discord.Client):
         posts = self.recent.take((guild.id, member_id), time.monotonic() - window)
         targets = [self.partial(guild, c, m) for c, m in posts if m not in skip]
         return await self.delete([t for t in targets if t])
+
+    async def search_posts(self, guild: discord.Guild, user_id: int, since: float) -> list[dict]:
+        """Every message a member posted since a time, from Discord's own message search. It reads
+        Discord's records, not ScamGuard's memory, so it works after a restart."""
+        found: list[dict] = []
+        route = discord.http.Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild.id)
+        offset = 0
+        while offset < SEARCH_MAX:
+            params = {"author_id": str(user_id), "min_id": str(snowflake_at(since)), "limit": SEARCH_PAGE,
+                      "offset": offset, "include_nsfw": "true"}
+            for _ in range(3):
+                data = await self.http.request(route, params=params)
+                if isinstance(data, dict) and "messages" in data:
+                    break
+                # Discord answers 202 while it is still indexing: wait as long as it asks
+                await asyncio.sleep(float(data.get("retry_after", 2)) if isinstance(data, dict) else 2)
+            else:
+                return found
+            for group in data["messages"]:
+                found += [m for m in group if m.get("author", {}).get("id") == str(user_id)]
+            offset += SEARCH_PAGE
+            if offset >= int(data.get("total_results", 0)):
+                break
+        return found
+
+    async def cleanup(self, guild: discord.Guild, user_id: int, caught_id: int, action: str) -> int:
+        """Delete what a removed member posted around a catch, found through Discord's search.
+
+        In a trap channel or a thread under one: everything from 10 minutes before the catch until now.
+        Anywhere else: everything from the purge window before the catch until 2 minutes after it.
+        Later posts outside the trap are left alone, since a person can come back and chat normally.
+        """
+        caught = snowflake_time(caught_id)
+        window = QUICK_SWEEP
+        if action in ("ban", "softban"):
+            window = max(QUICK_SWEEP, self.settings.purge_hours * 3600)
+        traps = set(self.settings.honeypot_channel_ids)
+        try:
+            posts = await self.search_posts(guild, user_id, caught - window)
+        except discord.HTTPException as exc:
+            log.warning("Message search for %s failed (HTTP %s)", user_id, exc.status)
+            return 0
+        targets = []
+        for post in posts:
+            cid, mid = int(post["channel_id"]), int(post["id"])
+            channel = guild.get_channel_or_thread(cid)
+            in_trap = cid in traps or getattr(channel, "parent_id", None) in traps
+            at = snowflake_time(mid)
+            if (in_trap and at >= caught - TRAP_LOOKBACK) or caught - window <= at <= caught + QUICK_SWEEP:
+                targets.append(self.partial(guild, cid, mid))
+        return await self.delete([t for t in targets if t])
+
+    def queue_cleanup(self, guild_id: int, user_id: int, caught_id: int, action: str) -> None:
+        """Run cleanup() once Discord's search has indexed the latest posts. Saved, so a restart keeps it."""
+        self.state.cleanups.append([guild_id, user_id, caught_id, action, time.time() + SEARCH_DELAY])
+        self.save_state()
+
+    async def run_cleanups(self) -> None:
+        now = time.time()
+        due = [c for c in self.state.cleanups if c[4] <= now]
+        if not due:
+            return
+        self.state.cleanups = [c for c in self.state.cleanups if c[4] > now]
+        self.save_state()
+        for guild_id, user_id, caught_id, action, _ in due:
+            guild = self.get_guild(guild_id)
+            if guild is not None and self.allowed(guild_id):
+                deleted = await self.cleanup(guild, user_id, caught_id, action)
+                if deleted:
+                    log.info("Follow-up cleanup deleted %d post(s) by %s", deleted,
+                             self.readable(guild, f"<@{user_id}>"))
 
     def can_act_on(self, member: discord.Member) -> bool:
         me = member.guild.me
@@ -952,14 +1050,32 @@ class ScamGuard(discord.Client):
             return True
         return False
 
+    def readable(self, guild: discord.Guild, text: str, users: dict | None = None) -> str:
+        """Turn mentions into names for the console log: <@id> becomes @name (id), and the same for
+        channels and roles. Members come from `users` when the cache doesn't hold them."""
+        users = users or {}
+
+        def name(match: re.Match) -> str:
+            kind, ident = match.group(1), int(match.group(2))
+            if kind == "#":
+                found = guild.get_channel_or_thread(ident)
+                return where(found) if found else f"#{ident}"
+            if kind == "@&":
+                found = getattr(guild, "get_role", lambda _: None)(ident)
+                return f"@{found.name} ({ident})" if found else f"@&{ident}"
+            found = users.get(ident) or getattr(guild, "get_member", lambda _: None)(ident) or self.get_user(ident)
+            return who(found) if found else f"@{ident}"
+        return MENTION_RE.sub(name, text)
+
     async def report(self, guild: discord.Guild | None, lines: list[str], evidence: list[bytes] = (),
-                     view: discord.ui.View | None = None, ping: bool = False) -> discord.Message | None:
+                     view: discord.ui.View | None = None, ping: bool = False,
+                     users: dict | None = None) -> discord.Message | None:
         if guild is None:
             return None
         text = "\n".join(lines)
         # The console log is kept on disk, so it gets the report without the quoted message text.
         logged = " | ".join(line.replace("\n", " ") for line in lines if not line.startswith("Text:\n"))
-        log.info("[%s] %s", guild.name, logged)
+        log.info("[%s] %s", guild.name, self.readable(guild, logged, users))
         channel = self.log_channel(guild)
         if channel is None or guild.me is None:
             return None
@@ -1175,6 +1291,10 @@ class ApplyButton(discord.ui.DynamicItem[discord.ui.Button],
             result = outcome.text
             if outcome.applied:
                 await bot.sweep(guild, member.id, action, {self.mid})
+                swept = await bot.cleanup(guild, member.id, self.mid, action)
+                if swept:
+                    result += f" Also deleted {swept} other post(s) of theirs."
+                bot.queue_cleanup(guild.id, member.id, self.mid, action)
             if not staff:  # counted the same way as a live catch in enforce()
                 bot.state.record_catch(self.rule)
                 bot.save_state()
