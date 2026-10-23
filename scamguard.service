@@ -1,0 +1,51 @@
+# Hardened systemd unit for running ScamGuard as its own unprivileged user.
+# Setup steps are in README.md, under "Run it as its own user".
+[Unit]
+Description=ScamGuard Discord anti-scam bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=scamguard
+Group=scamguard
+WorkingDirectory=/opt/scamguard
+# Read by systemd as root before it drops privileges: keep it root-owned, mode 600.
+EnvironmentFile=/etc/scamguard/scamguard.env
+Environment=DATA_DIR=/var/lib/scamguard
+StateDirectory=scamguard
+StateDirectoryMode=0700
+ExecStart=/opt/scamguard/venv/bin/python /opt/scamguard/ScamGuard.py
+Restart=on-failure
+RestartSec=15
+
+# --- sandboxing ---
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -379,6 +379,19 @@ class SettingsCommands(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b.settings.exempt_role_ids, [])
         self.assertEqual(b.report.await_count, 3)
 
+    async def test_manager_role_alone_cannot_add_fingerprints_or_release_the_brake(self):
+        b = make_bot(manager_role_ids=[33])
+        it = admin_interaction(b, discord.Permissions.none())
+        it.user.roles = [SimpleNamespace(id=33)]
+        with mock.patch.object(bot.discord, "Member", FakeMember):
+            self.assertTrue(bot.is_moderator(it))  # status, list and check still work
+            await bot.add_scam_image.callback(it, SimpleNamespace(id=1))
+            self.assertIn("Ban Members", it.response.send_message.await_args.args[0])
+            b.braked.add(999)
+            await bot.resume_cmd.callback(it)
+            self.assertIn("Ban Members", it.response.send_message.await_args.args[0])
+        self.assertIn(999, b.braked)
+
     async def test_lists_need_manage_server(self):
         b = make_bot()
         it = admin_interaction(b, discord.Permissions(ban_members=True))

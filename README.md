@@ -26,7 +26,7 @@ It was built for a 43,000-member server to replace two bots, [Honeypot](https://
 |---|---|
 | Copies of real scam images matched | 84 of 84, all within 14 of 256 bits |
 | Member uploads matched by mistake | 0 of 601, the closest 92 bits away |
-| Tests, on every push | 89, on Python 3.11, 3.12 and 3.13 |
+| Tests, on every push | 93, on Python 3.11, 3.12 and 3.13 |
 
 ## What it catches
 
@@ -57,7 +57,7 @@ flowchart TD
 
 | Rule | Catches | Default action |
 |---|---|---|
-| Trap channel | Any post by a non-staff member in a trap channel, or in a thread under one | softban |
+| Trap channel | Any post by a non-staff member in a trap channel, or in a thread they started under one | softban |
 | Known scam image | An image whose fingerprint matches a stored scam image | softban |
 | Same post across channels | One post (same picture, or the same text or link) in 3 channels within 10 seconds | 24-hour timeout |
 
@@ -73,7 +73,7 @@ When ScamGuard acts on someone it:
 6. For two minutes afterward, deletes anything else that account posts.
 7. Posts a report with buttons: Unban, Remove timeout, and Block these images, which fingerprints the images in a trap or cross-channel catch.
 
-Staff are never punished. That means anyone with Ban Members, Kick Members, Timeout Members, Manage Messages, Manage Server or Administrator, plus the roles added with `/scamguard exempt add`. A staff post that matches a scam image is still deleted and reported, in case the account was taken over. Staff posts in a trap channel are ignored.
+Staff are never punished. That means anyone with Ban Members, Kick Members, Timeout Members, Manage Messages, Manage Server or Administrator, plus the roles added with `/scamguard exempt add`. A staff post that matches a scam image is still deleted and reported, in case the account was taken over. Staff posts in a trap channel are ignored. So are replies in someone else's thread under a trap channel: a thread can be shared by link, and whoever opens it that way never sees the warning. The moderators get one alert per thread instead.
 
 ## How it compares
 
@@ -160,7 +160,7 @@ Then put ScamGuard's highest role above the member roles it should act on and be
 
 ### 3. Run it
 
-ScamGuard needs Python 3.11 or later. The tests run on 3.13 with discord.py 2.7.1 and Pillow 11.3.
+ScamGuard needs Python 3.11 or later. `requirements.txt` pins the versions CI tests: discord.py 2.7.1, Pillow 13.0 and python-dotenv 1.2.4. It also runs on Pillow 11.3.
 
 ```
 python3 -m venv venv
@@ -177,6 +177,22 @@ pm2 start ScamGuard.py --name ScamGuard --interpreter ./venv/bin/python
 pm2 save
 ```
 
+#### Run it as its own user
+
+ScamGuard opens image files from strangers, so give it an account that can't touch anything else. Run pm2 as a dedicated user, or use the hardened systemd unit included here. It runs ScamGuard as an unprivileged `scamguard` user with a read-only system, no home directory, no extra privileges, and its data in `/var/lib/scamguard`:
+
+```
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin scamguard
+sudo mkdir -p /opt/scamguard /etc/scamguard
+sudo cp ScamGuard.py rules.py scanner.py add_reference.py seed_references.json requirements.txt /opt/scamguard/
+sudo python3 -m venv /opt/scamguard/venv
+sudo /opt/scamguard/venv/bin/pip install -r /opt/scamguard/requirements.txt
+sudo install -m 600 -o root -g root .env /etc/scamguard/scamguard.env
+sudo cp scamguard.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now scamguard
+journalctl -u scamguard -f
+```
+
 `.env` holds the bot token and nothing else. Everything else is set in Discord and saved by the bot in `data/`: `settings.json` (every setting below), `references.json` (fingerprints) and `state.json` (catch counts, banner message IDs).
 
 ScamGuard serves one server: the first server it joins that the application's owner belongs to. It saves that server and registers its commands there. In any other server it does nothing, and it never leaves one, so a stranger who adds it gets nothing. If it is removed from its server, it serves the next one its owner invites it to.
@@ -184,14 +200,14 @@ ScamGuard serves one server: the first server it joins that the application's ow
 ### 4. Configure it in Discord and go live
 
 1. It starts in dry run: it forwards and reports what it would do, each report has a Take action button, and nothing is deleted.
-2. `/scamguard config log_channel:#your-mod-log`. Use a private, mods-only channel: forwarded evidence lands there.
-3. `/scamguard honeypot add channel:#some-channel`. Pick a channel nobody has a reason to post in, and give it a name that doesn't say "trap". Its warning banner waits for live mode.
+2. `/scamguard config log_channel:#your-mod-log`. Use a channel only staff can read. If any role that isn't staff can read it, ScamGuard leaves the quoted text, the forwarded post and the images out of its reports. A role only bots hold counts too: add it with `/scamguard exempt add role:`.
+3. `/scamguard honeypot add channel:#some-channel`. Pick a channel nobody has a reason to post in, and give it a name that doesn't say "trap". Turn off Create Public Threads and Create Private Threads for members there, so nobody can open a bait thread under it. Its warning banner waits for live mode.
 4. `/scamguard status` lists anything still missing: permissions, role position, channel access.
 5. After a day or two of clean reports, `/scamguard config mode:live`. That posts the warning banner in each trap channel.
 
 ## Commands
 
-Everything replies only to you. Day-to-day use needs Ban Members or a manager role. Settings, trap channels and the role and channel lists need Manage Server.
+Everything replies only to you. Checking images, listing and removing fingerprints, and `/scamguard status` need Ban Members or a manager role. Adding fingerprints, the Take action and Block these images buttons, and releasing the safety brake need Ban Members, because each of them leads to removals. Settings, trap channels and the role and channel lists need Manage Server.
 
 | Command | Does |
 |---|---|
@@ -201,7 +217,7 @@ Everything replies only to you. Day-to-day use needs Ban Members or a manager ro
 | `/scamguard config` | Change the settings below (Manage Server) |
 | `/scamguard honeypot add / remove / banner` | Manage trap channels and their warning banner (Manage Server) |
 | `/scamguard exempt add / remove` | A role whose members are never punished (their scam posts are still deleted), or a channel ScamGuard ignores (Manage Server) |
-| `/scamguard managers add / remove` | A role that can use the day-to-day commands and buttons without Ban Members (Manage Server) |
+| `/scamguard managers add / remove` | A role that can check images, list and remove fingerprints, and see status without Ban Members (Manage Server) |
 | `/scamguard list` / `remove <id>` | List or delete fingerprints |
 | `/scamguard resume` | Release the safety brake |
 
@@ -241,7 +257,9 @@ The cross-channel window is short because speed is the signal. MadHoney uses 5 s
 - The token is read from `.env`, removed from the environment after reading, and never logged.
 - No Administrator, Manage Roles, Manage Channels or Manage Server. Startup warns if it has Administrator.
 - It serves one server that its owner belongs to, registers commands only there, and never leaves other servers, in case the token is ever shared.
-- The role and channel lists that decide who is exempt and who manages ScamGuard need Manage Server to change, so a manager can't widen their own access. Every change is posted in the log channel.
+- The role and channel lists that decide who is exempt and who manages ScamGuard need Manage Server to change, so a manager can't widen their own access. Every change is posted in the log channel. A manager role can't add fingerprints or release the brake, because both lead to removals.
+- A report shows the scam's text, a forwarded copy and its images only when no role that isn't staff can read the log channel. The check runs role by role, so a member role that can see the channel counts even when @everyone can't.
+- Removal DMs name the trap's parent channel, never a thread, and strip everything but letters, digits, hyphens and underscores. A member who titles a thread can't put a link in ScamGuard's DM.
 - Image files from strangers are the main attack surface. Only PNG, JPEG, WEBP and GIF decoders are reachable. Pixel dimensions are checked before decoding. Downloads are capped at 15 MB, come only from Discord's CDN over HTTPS without following redirects, and four at most are processed at once with a 30-second limit each.
 - Startup checks permissions, the log channel's privacy, trap channel access and role position, then posts any problems in the log channel and in `/scamguard status`.
 - What it can't protect against: a leaked token (reset it at once), a moderator who fingerprints an innocent image (the log shows who added what, and the brake limits the damage), scams that continue in DMs, and text scams with no trap or cross-channel pattern (keyword filters and AutoMod cover those).
@@ -256,11 +274,11 @@ Message text and images are processed in memory and discarded. In `data/`, ScamG
 python3 -m unittest discover -s tests -v
 ```
 
-89 tests cover image decoding safety, fingerprints, the reference store, the cross-channel tracker, settings and the commands that change them, binding to one server, the three rules end to end, the DM order, the review button, and shared-token safety.
+93 tests cover image decoding safety, fingerprints, the reference store, the cross-channel tracker, settings and the commands that change them, binding to one server, the three rules end to end, the DM order, the review button, and shared-token safety.
 
 ## Credits
 
-Swampfrog created the original ScamGuard: the image fingerprinting, the hardened image handling, the cross-channel image check, the safety brake and dry run. Hifihedgehog added the trap channel, the cross-channel text and link check, the settings commands and the real-file seed.
+Swampfrog created the original ScamGuard: the image fingerprinting, the hardened image handling, the cross-channel image check, the safety brake and dry run. His security review of 2.0 led to 2.0.1: no punishment for replies in bait threads, link-proof removal DMs, a role-by-role log privacy check, and the systemd unit. Hifihedgehog added the trap channel, the cross-channel text and link check, the settings commands and the real-file seed.
 
 ## License
 

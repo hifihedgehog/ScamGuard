@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 import rules
 import scanner
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 log = logging.getLogger("scamguard")
 HERE = Path(__file__).resolve().parent
 SEED_FILE = HERE / "seed_references.json"
@@ -266,6 +266,7 @@ class ScamGuard(discord.Client):
         self.banner_edited = 0.0
         self.housekeeper: asyncio.Task | None = None
         self._owner_ids: set[int] | None = None
+        self.thread_alerts: dict[int, float] = {}
 
     # ---------------------------------------------------------------- startup
     async def setup_hook(self) -> None:
@@ -484,8 +485,12 @@ class ScamGuard(discord.Client):
             cp = channel.permissions_for(me)
             if not (cp.view_channel and cp.send_messages and cp.read_message_history):
                 out.append(f"I can't post in {channel.mention}.")
-            if channel.permissions_for(guild.default_role).view_channel:
-                out.append(f"{channel.mention} is visible to @everyone. Make it mods-only: evidence lands there.")
+            readers = self.log_readers(guild, channel)
+            if readers:
+                names = ", ".join(discord.utils.escape_markdown(r.name) for r in readers[:5])
+                out.append(f"Roles that aren't staff can read {channel.mention}: {names}. Until it's mods-only, "
+                           "reports leave out the quoted text, the forwarded post and the images. If only bots "
+                           "or staff hold a role, add it with `/scamguard exempt add role:`.")
         if not s.honeypot_channel_ids:
             out.append("No trap channel is set. Add one with `/scamguard honeypot add`.")
         for cid in s.honeypot_channel_ids:
@@ -496,6 +501,11 @@ class ScamGuard(discord.Client):
             cp = trap.permissions_for(me)
             if not (cp.view_channel and cp.read_message_history and cp.manage_messages):
                 out.append(f"I need View Channel, Read Message History and Manage Messages in {trap.mention}.")
+            elif any(trap.permissions_for(r).create_public_threads or trap.permissions_for(r).create_private_threads
+                     for r in guild.roles if not r.managed and not self.staff_role(r)):
+                out.append(f"Members can create threads in {trap.mention}. A thread there makes easy bait, "
+                           "because people who open it from a link never see the warning. Turn off Create Public "
+                           "Threads and Create Private Threads for members in that channel.")
             elif not s.dry_run and str(cid) not in self.state.banners:
                 out.append(f"{trap.mention} has no ScamGuard warning banner. Run `/scamguard honeypot banner`.")
         member_roles = [r for r in guild.roles if not r.managed and not r.is_default() and not self.staff_role(r)]
@@ -595,10 +605,14 @@ class ScamGuard(discord.Client):
             return
         staff = self.is_staff(member)
         if not edited and where & set(s.honeypot_channel_ids):
+            channel = message.channel
+            in_thread = channel.id not in s.honeypot_channel_ids  # a thread under a trap channel
             if staff:
-                log.info("Staff member %s posted in trap channel %s; ignored", member.id, message.channel.id)
+                log.info("Staff member %s posted in trap channel %s; ignored", member.id, channel.id)
+            elif in_thread and getattr(channel, "owner_id", None) != member.id:
+                await self.bait_thread(message, member)
             else:
-                await self.enforce(message, member, "trap", f"posted in {message.channel.mention}, a trap channel", [])
+                await self.enforce(message, member, "trap", f"posted in {channel.mention}, a trap channel", [])
             return
 
         check_blast = not edited and not staff and s.blast_channels >= 2
@@ -628,6 +642,21 @@ class ScamGuard(discord.Client):
                 await self.enforce(message, member, "blast",
                                    f"the same post in {channels} channels within {s.blast_seconds}s",
                                    scans, [m for m in earlier if m])
+
+    async def bait_thread(self, message: discord.Message, member: discord.Member) -> None:
+        """A reply in someone else's thread under a trap channel. A thread can be shared by link, and
+        whoever opens it that way never sees the trap's warning, so the reply is never punished.
+        The moderators hear about the thread once."""
+        thread, now = message.channel, time.monotonic()
+        if now - self.thread_alerts.get(thread.id, float("-inf")) < REPEAT_WINDOW:
+            return
+        self.thread_alerts[thread.id] = now
+        owner_id = getattr(thread, "owner_id", None)
+        await self.report(message.guild, [
+            f"🍯 {member.mention} replied in {thread.mention}, a thread "
+            f"{f'<@{owner_id}>' if owner_id else 'someone'} started under a trap channel. Not punished: "
+            "people who open a thread from a link never see the trap's warning.",
+            "If the thread is bait, delete it and deal with whoever started it."])
 
     def partial(self, guild: discord.Guild, channel_id: int, message_id: int) -> discord.PartialMessage | None:
         channel = guild.get_channel_or_thread(channel_id)
@@ -731,9 +760,16 @@ class ScamGuard(discord.Client):
             lines.append(f"Text:\n```{excerpt}```")
         return lines
 
+    def log_readers(self, guild: discord.Guild, channel) -> list[discord.Role]:
+        """Roles that can read a channel without being staff, exempt or bot-managed. Checked one role at a
+        time, so a member role that sees the channel counts even when @everyone can't."""
+        return [r for r in guild.roles
+                if not r.managed and not self.staff_role(r) and channel.permissions_for(r).view_channel]
+
     async def forward(self, message: discord.Message, channel) -> discord.Message | None:
-        """Forward the original post to the log channel before it is deleted: text and files intact."""
-        if channel is None or message.type not in ACTIONABLE:
+        """Forward the original post to the log channel before it is deleted: text and files intact.
+        Skipped when members can read the log, or the forward would show them the scam again."""
+        if channel is None or message.type not in ACTIONABLE or self.log_readers(message.guild, channel):
             return None
         try:
             return await asyncio.wait_for(message.forward(channel), FORWARD_TIMEOUT)
@@ -816,7 +852,11 @@ class ScamGuard(discord.Client):
         if not self.dm_limit.allow():
             log.info("DM rate limit reached; not messaging %s", member.id)
             return False
-        text = dm_text(member.guild.name, rule, action, getattr(channel, "name", "trap"),
+        # Name the parent channel, never a thread: anyone can title a thread, including with a link.
+        # Only letters, digits, hyphens and underscores survive, so no name can form a link.
+        name = getattr(getattr(channel, "parent", None), "name", None) or getattr(channel, "name", None) or ""
+        name = re.sub(r"[^\w-]", "", name).strip("-_") or "trap"
+        text = dm_text(member.guild.name, rule, action, discord.utils.escape_markdown(name),
                        self.settings.timeout_hours, self.rejoin_link(member.guild))
         try:
             await asyncio.wait_for(member.send(text), DM_TIMEOUT)
@@ -923,11 +963,13 @@ class ScamGuard(discord.Client):
         channel = self.log_channel(guild)
         if channel is None or guild.me is None:
             return None
+        if self.log_readers(guild, channel):  # members can read it: keep the scam itself out
+            text = "\n".join(line for line in lines if not line.startswith("Text:\n"))
+            evidence = ()
         extra: dict = {}
         if view is not None:
             extra["view"] = view
-        if (evidence and channel.permissions_for(guild.me).attach_files
-                and not channel.permissions_for(guild.default_role).view_channel):
+        if evidence and channel.permissions_for(guild.me).attach_files:
             extra["files"] = [discord.File(io.BytesIO(d), filename=f"SPOILER_evidence_{i + 1}.{_ext(d)}")
                               for i, d in enumerate(evidence)]
         role_id = self.settings.alert_role_id
@@ -1022,6 +1064,12 @@ def is_moderator(interaction: discord.Interaction) -> bool:
 def is_admin(interaction: discord.Interaction) -> bool:
     """Settings and trap channels: Manage Server."""
     return has_perm(interaction, "manage_guild")
+
+
+def can_remove(interaction: discord.Interaction) -> bool:
+    """Adding a fingerprint or releasing the brake leads to removals, so it takes Ban Members.
+    A manager role alone isn't enough."""
+    return has_perm(interaction, "ban_members")
 
 
 async def deny(interaction: discord.Interaction, need: str = "Ban Members (or a ScamGuard manager role)") -> None:
@@ -1150,8 +1198,8 @@ class LearnButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sg:learn
 
     async def callback(self, interaction: discord.Interaction) -> None:
         bot = _bot(interaction)
-        if bot is None or not is_moderator(interaction):
-            return await deny(interaction)
+        if bot is None or not can_remove(interaction):
+            return await deny(interaction, "Ban Members")
         await interaction.response.defer(ephemeral=True, thinking=True)
         channel = interaction.guild.get_channel_or_thread(self.cid)
         try:
@@ -1230,8 +1278,8 @@ async def learn_from(interaction: discord.Interaction, message: discord.Message)
 @app_commands.default_permissions(ban_members=True)
 @app_commands.guild_only()
 async def add_scam_image(interaction: discord.Interaction, message: discord.Message) -> None:
-    if not is_moderator(interaction):
-        return await deny(interaction)
+    if not can_remove(interaction):
+        return await deny(interaction, "Ban Members")
     await interaction.response.defer(ephemeral=True, thinking=True)
     reply, _ = await learn_from(interaction, message)
     await interaction.followup.send(reply, ephemeral=True)
@@ -1547,7 +1595,7 @@ async def exempt_remove(interaction: discord.Interaction, role: discord.Role | N
     await edit_lists(interaction, False, exempt_items(role, channel))
 
 
-@managers_group.command(name="add", description="Let a role manage fingerprints and use review buttons (Manage Server)")
+@managers_group.command(name="add", description="Let a role check images, list and remove fingerprints, and see status (Manage Server)")
 async def managers_add(interaction: discord.Interaction, role: discord.Role) -> None:
     if role.is_default():
         return await interaction.response.send_message("@everyone can't be a manager role.", ephemeral=True)
@@ -1596,8 +1644,8 @@ async def remove_cmd(interaction: discord.Interaction, ref_id: app_commands.Rang
 
 @scamguard_group.command(name="resume", description="Release the safety brake after reviewing recent actions")
 async def resume_cmd(interaction: discord.Interaction) -> None:
-    if not is_moderator(interaction):
-        return await deny(interaction)
+    if not can_remove(interaction):
+        return await deny(interaction, "Ban Members")
     bot: ScamGuard = interaction.client  # type: ignore[assignment]
     was_on = interaction.guild_id in bot.braked
     bot.braked.discard(interaction.guild_id)

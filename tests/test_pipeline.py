@@ -169,13 +169,69 @@ class Pipeline(unittest.IsolatedAsyncioTestCase):
         b.schedule_banner_update.assert_called_once()
         self.assertEqual(b.state.totals, {"trap": 1})
 
-    async def test_trap_catches_threads_under_the_trap(self):
+    async def test_trap_catches_its_own_thread_creator(self):
         b = self.make()
         m = self.member()
         msg = self.message(m, content="hi", channel_id=4242)
-        msg.channel.parent_id = TRAP
+        msg.channel.parent_id, msg.channel.owner_id = TRAP, m.id
         await self.send(b, msg)
         m.ban.assert_awaited_once()
+
+    async def test_replies_in_someone_elses_trap_thread_are_never_punished(self):
+        b = self.make()
+        for mid, uid in ((1, 50), (2, 51)):  # two people take the bait
+            m = self.member(uid=uid)
+            msg = self.message(m, content="free gifts?", channel_id=4242, mid=mid)
+            msg.channel.parent_id, msg.channel.owner_id = TRAP, 99
+            await self.send(b, msg)
+            msg.delete.assert_not_awaited()
+            m.ban.assert_not_awaited()
+            m.send.assert_not_awaited()
+        self.assertEqual(b.report.await_count, 1)  # one alert per thread
+        self.assertIn("Not punished", self.report_text(b))
+        self.assertEqual(b.state.totals, {})
+
+    async def test_dm_names_the_parent_channel_and_never_a_link(self):
+        b = self.make()
+        m = self.member()
+        thread = SimpleNamespace(name="[claim here](https://free-gifts.example)", parent=SimpleNamespace(name="trap_channel"))
+        await b.dm(m, "trap", "softban", thread)
+        text = m.send.await_args.args[0]
+        self.assertIn("#trap", text)
+        self.assertNotIn("free-gifts", text)
+        self.assertNotIn("://", text)
+        m2 = self.member(uid=51)  # a thread whose parent isn't cached: its own name, stripped
+        await b.dm(m2, "trap", "softban", SimpleNamespace(name="[x](https://evil.example/claim)"))
+        text2 = m2.send.await_args.args[0]
+        self.assertNotIn("://", text2)
+        self.assertNotIn("evil.example", text2)
+        self.assertNotIn("](", text2)
+
+    async def test_log_readable_by_members_gets_no_scam_content(self):
+        b = self.make(log_channel_id=5)
+        b.report = bot.ScamGuard.report.__get__(b)
+        b.forward = bot.ScamGuard.forward.__get__(b)
+        member_role = SimpleNamespace(id=7, managed=False, permissions=discord.Permissions.none())
+        mod_role = SimpleNamespace(id=8, managed=False, permissions=discord.Permissions(ban_members=True))
+        self.guild.roles = [member_role, mod_role]
+        sent = []
+
+        async def send(text, **extra):
+            sent.append((text, extra))
+        log_channel = SimpleNamespace(id=5, send=send, permissions_for=lambda who: SimpleNamespace(
+            view_channel=who is not None, attach_files=True))
+        self.guild.get_channel_or_thread = lambda cid: log_channel if cid == 5 else SimpleNamespace(
+            id=cid, mention=f"<#{cid}>", get_partial_message=lambda mid: SimpleNamespace(id=mid, delete=mock.AsyncMock()))
+        self.guild.me = SimpleNamespace(top_role=Role(10))
+        with mock.patch.object(bot.discord.abc, "Messageable", SimpleNamespace):
+            self.assertEqual(b.log_readers(self.guild, log_channel), [member_role])
+            msg = self.message(self.member(), content="scam link https://scam.example", image=True)
+            self.assertIsNone(await b.forward(msg, log_channel))
+            await b.report(self.guild, ["**known scam image**: x", "Text:\n```scam link https://scam.example```"],
+                           [b"\x89PNG fake"])
+        text, extra = sent[-1]
+        self.assertNotIn("scam.example", text)
+        self.assertNotIn("files", extra)
 
     async def test_staff_in_trap_is_ignored(self):
         b = self.make()
